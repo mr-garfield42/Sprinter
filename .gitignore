@@ -1,0 +1,9 @@
+# Local secrets / runtime state — contains your API key, do NOT commit
+config.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / tooling
+.claude/
