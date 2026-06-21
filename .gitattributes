@@ -1,0 +1,13 @@
+# Keep line endings correct across Windows and macOS regardless of core.autocrlf.
+
+# Shell scripts run on macOS and MUST stay LF (CRLF breaks the shebang).
+*.command text eol=lf
+*.sh      text eol=lf
+
+# Windows batch files want CRLF.
+*.bat     text eol=crlf
+
+# Source and docs: store as LF in the repo.
+*.py      text eol=lf
+*.md      text eol=lf
+*.txt     text eol=lf

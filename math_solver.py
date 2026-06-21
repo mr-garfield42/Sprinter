@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import os
+import sys
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -11,11 +12,8 @@ from tkinter import simpledialog
 import requests
 from PIL import ImageGrab
 
-try:
-    import pygetwindow as gw
-    HAS_PYGETWINDOW = True
-except ImportError:
-    HAS_PYGETWINDOW = False
+IS_MAC = sys.platform == "darwin"
+IS_WIN = sys.platform == "win32"
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 # Google Gemini, via its OpenAI-compatible endpoint. Free tier includes vision.
@@ -90,22 +88,91 @@ def record_use():
     return cfg["usage_count"]
 
 
+def _active_window_bbox_windows():
+    """Active-window bounds (left, top, right, bottom) in pixels, or None."""
+    try:
+        import pygetwindow as gw
+
+        win = gw.getActiveWindow()
+        if win and win.title and win.title != GUI_TITLE:
+            left, top = win.left, win.top
+            right, bottom = left + win.width, top + win.height
+            if right > left and bottom > top:
+                return (left, top, right, bottom)
+    except Exception:
+        pass
+    return None
+
+
+def _active_window_bbox_macos():
+    """Frontmost-window bounds (left, top, right, bottom) in logical points, or None.
+
+    Uses Quartz directly. Our own always-on-top GUI sits at a floating window
+    level (layer != 0), so filtering on the normal layer skips it.
+    """
+    try:
+        import Quartz
+
+        windows = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListExcludeDesktopElements
+            | Quartz.kCGWindowListOptionOnScreenOnly,
+            Quartz.kCGNullWindowID,
+        )
+        for win in windows:
+            if win.get("kCGWindowLayer") != 0:
+                continue
+            name = win.get(Quartz.kCGWindowName, "") or ""
+            if name == GUI_TITLE:
+                continue
+            bounds = win.get("kCGWindowBounds")
+            if not bounds:
+                continue
+            left, top = int(bounds["X"]), int(bounds["Y"])
+            right, bottom = left + int(bounds["Width"]), top + int(bounds["Height"])
+            if right > left and bottom > top:
+                return (left, top, right, bottom)
+    except Exception:
+        pass
+    return None
+
+
 def capture_active_window():
     """Capture the currently active window. Falls back to full screen."""
-    if HAS_PYGETWINDOW:
-        try:
-            win = gw.getActiveWindow()
-            if win and win.title and win.title != GUI_TITLE:
-                left = win.left
-                top = win.top
-                right = win.left + win.width
-                bottom = win.top + win.height
-                if right > left and bottom > top:
-                    return ImageGrab.grab(bbox=(left, top, right, bottom))
-        except Exception:
-            pass
-    # Fallback: full screen
-    return ImageGrab.grab()
+    full = ImageGrab.grab()  # whole screen; pixels (Retina-scaled on macOS)
+
+    if IS_WIN:
+        bbox = _active_window_bbox_windows()
+        if bbox:
+            try:
+                return ImageGrab.grab(bbox=bbox)
+            except Exception:
+                pass
+        return full
+
+    if IS_MAC:
+        bbox = _active_window_bbox_macos()
+        if bbox:
+            # Quartz reports logical points; ImageGrab returns physical pixels.
+            # Scale the crop box so it lines up on Retina (and non-Retina) displays.
+            scale = 1.0
+            try:
+                import Quartz
+
+                logical_w = Quartz.CGDisplayBounds(
+                    Quartz.CGMainDisplayID()
+                ).size.width
+                if logical_w:
+                    scale = full.width / logical_w
+            except Exception:
+                pass
+            left, top, right, bottom = (int(v * scale) for v in bbox)
+            try:
+                return full.crop((left, top, right, bottom))
+            except Exception:
+                pass
+        return full
+
+    return full
 
 
 def image_to_base64(img):
@@ -307,11 +374,24 @@ def main():
         if api_key:
             save_api_key(api_key)
 
-    if not HAS_PYGETWINDOW:
-        print(
-            "Warning: pygetwindow not installed — falling back to full-screen capture.\n"
-            "Install it with:  pip install pygetwindow"
-        )
+    # Warn if the per-window capture helper for this OS is unavailable; the app
+    # still works, it just captures the whole screen instead of one window.
+    if IS_WIN:
+        try:
+            import pygetwindow  # noqa: F401
+        except ImportError:
+            print(
+                "Note: pygetwindow not installed — capturing the full screen.\n"
+                "For active-window capture:  pip install pygetwindow"
+            )
+    elif IS_MAC:
+        try:
+            import Quartz  # noqa: F401
+        except ImportError:
+            print(
+                "Note: pyobjc (Quartz) not installed — capturing the full screen.\n"
+                "For active-window capture:  pip install pyobjc-framework-Quartz"
+            )
 
     app = MathSolverApp(root, api_key, args.model, args.daily_limit)
     print(f"Math Solver running. Click 'Scan & Solve' then switch to your math window.")

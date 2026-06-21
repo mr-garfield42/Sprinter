@@ -1,3 +1,6 @@
 Pillow
-pygetwindow
 requests
+
+# Active-window capture (optional — app falls back to full-screen without these)
+pygetwindow; sys_platform == "win32"
+pyobjc-framework-Quartz; sys_platform == "darwin"
