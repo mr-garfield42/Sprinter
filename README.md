@@ -16,6 +16,12 @@ arithmetic, algebra, and word problems.
 
 ## Usage
 
+**Easiest:** double-click **`Run Sprinter.bat`**. It checks the dependencies
+(installing them if needed) and launches the GUI with no console window — handy
+on Windows machines that have no `.py` file association set up.
+
+Or run it directly:
+
 ```
 python math_solver.py
 ```
