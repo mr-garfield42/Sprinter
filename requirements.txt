@@ -1,3 +1,5 @@
 Pillow
 pygetwindow
 requests
+pyautogui
+opencv-python
