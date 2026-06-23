@@ -99,7 +99,12 @@ PROMPT = (
     "keyboard: use ^ for exponents (e.g. x^2), / for fractions (e.g. 3/4), * for "
     "multiplication, and pi for the constant pi. For square roots write sqrt(...) "
     "with the radicand ALWAYS in parentheses, e.g. sqrt(2), sqrt(x+1), 2*sqrt(3). "
-    "Do NOT use Unicode superscripts/symbols, LaTeX, or \\frac."
+    "Do NOT use Unicode superscripts/symbols, LaTeX, or \\frac.\n\n"
+    "Finally, on its own LAST line, give the location of the button that SUBMITS "
+    "the answer — labeled 'Check' or 'Recheck', NOT the reset/refresh (circular "
+    "arrow) or close (X) icons — as 'CHECK (x%,y%)', using the same percentage "
+    "coordinates as above for the CENTER of that button. If no such button is "
+    "visible, write 'CHECK: none'."
 )
 # Matches a final-answer line like "ANSWER: 15" or, with a position hint,
 # "ANSWER (75%,30%): 15" (case-insensitive, tolerant of an index and ** markdown
@@ -114,20 +119,10 @@ ANSWER_RE = re.compile(
     r":\s*(.+)$"
 )
 
-# "Detect Check button": a separate one-shot vision call that locates the submit
-# button so it doesn't have to be calibrated by hand. The model returns the
-# button center as a percentage of the screenshot; locate_check_button() parses
-# it and the GUI maps it to absolute screen coordinates via the window offset.
-CHECK_PROMPT = (
-    "This is a screenshot of an online math exercise. Find the button that "
-    "SUBMITS the answer — it is labeled 'Check' or 'Recheck'. Do NOT pick the "
-    "reset/refresh (circular-arrow) icon or the close (X) icon. Reply with ONLY "
-    "one line and nothing else: 'CHECK (x%,y%)' giving the CENTER of that button, "
-    "where x is the horizontal position (0 = far left, 100 = far right) and y is "
-    "the vertical position (0 = top, 100 = bottom). If no Check/Recheck button is "
-    "visible, reply exactly 'CHECK: none'."
-)
-# Captures the (x%, y%) from a "CHECK (12%,88%)" / "CHECK: (12,88)" reply.
+# The main reply ends with a "CHECK (x%,y%)" line locating the submit button (see
+# PROMPT), so auto-fill can click Check without a hand-calibrated position. This
+# captures the (x%, y%) from "CHECK (12%,88%)" / "CHECK: (12,88)" (or no match for
+# "CHECK: none"); parse_check_pos() turns it into coordinates.
 CHECK_RE = re.compile(
     r"(?i)check\s*:?\s*[\(\[]\s*(\d{1,3})\s*%?\s*,\s*(\d{1,3})\s*%?\s*[\)\]]"
 )
@@ -503,6 +498,15 @@ def answers_display(parsed, raw):
     return "\n".join(val for val, _ in parsed) if parsed else raw.strip()
 
 
+def parse_check_pos(raw):
+    """Location of the Check/Recheck button from the reply's ``CHECK (x%,y%)``
+    line (see ``PROMPT``), as ``(x, y)`` percentages of the screenshot, or
+    ``None`` when the model reported no button. Auto-fill maps this to screen
+    coordinates so the submit button needs no manual calibration."""
+    m = CHECK_RE.search(raw)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def image_to_base64(img):
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -541,19 +545,6 @@ def solve_math(api_key, img, model=MODEL):
     return _vision_request(api_key, img, PROMPT, model)
 
 
-def locate_check_button(api_key, img, model=MODEL):
-    """Ask the vision model where the Check/Recheck (submit) button is.
-
-    Returns its center as ``(x, y)`` percentages of the screenshot (x
-    left->right, y top->bottom), or ``None`` if the model reports no such
-    button. Network/HTTP errors propagate to the caller.
-    """
-    raw = _vision_request(api_key, img, CHECK_PROMPT, model)
-    print(raw)  # for the console
-    m = CHECK_RE.search(raw)
-    return (int(m.group(1)), int(m.group(2))) if m else None
-
-
 class MathSolverApp:
     def __init__(self, root, api_key, model=MODEL, daily_limit=DAILY_LIMIT):
         self.root = root
@@ -569,7 +560,7 @@ class MathSolverApp:
         # Position in top-right corner
         root.update_idletasks()
         sw = root.winfo_screenwidth()
-        root.geometry(f"320x480+{sw - 340}+20")
+        root.geometry(f"320x445+{sw - 340}+20")
 
         self.status = tk.StringVar(value="Ready")
         tk.Label(root, textvariable=self.status, font=("Segoe UI", 10), pady=4).pack()
@@ -661,14 +652,6 @@ class MathSolverApp:
         )
         self.sqrt_btn.pack(side=tk.LEFT, padx=3)
 
-        # Auto-locate the Check button via the vision model (no manual hover).
-        # Runs one scan, saves the position; "Set Check ✓" still overrides it.
-        self.detect_check_btn = tk.Button(
-            root, text="Detect Check button (auto)", font=("Segoe UI", 8),
-            relief="flat", command=self.detect_check,
-        )
-        self.detect_check_btn.pack(pady=(0, 2))
-
         self.calib_status = tk.StringVar()
         tk.Label(root, textvariable=self.calib_status, font=("Segoe UI", 8), fg="#888").pack()
         self._update_calib_labels()
@@ -678,7 +661,6 @@ class MathSolverApp:
             self.box_btn.config(state=tk.DISABLED)
             self.check_btn.config(state=tk.DISABLED)
             self.sqrt_btn.config(state=tk.DISABLED)
-            self.detect_check_btn.config(state=tk.DISABLED)
             self.calib_status.set("Auto-fill needs: pip install pyautogui opencv-python")
 
         # Answer display (read-only, selectable so the answer can be copied)
@@ -785,78 +767,15 @@ class MathSolverApp:
         self._update_calib_labels()
         self.status.set(f"√ button set ({int(x)},{int(y)})")
 
-    # --- Detect Check button (one vision call; saves like "Set Check ✓") ---
-
-    def detect_check(self):
-        """Locate the Check/Recheck button with the vision model and save it."""
-        if self._scanning:
-            return
-        self._scanning = True
-        self.scan_btn.config(state=tk.DISABLED)
-        self._detect_countdown(COUNTDOWN_SECONDS)
-
-    def _detect_countdown(self, remaining):
-        if remaining > 0:
-            self.status.set(f"Show the Check button... {remaining}")
-            self.root.after(1000, self._detect_countdown, remaining - 1)
-        else:
-            self.status.set("Finding Check button...")
-            self.root.after(50, self._do_detect_check)
-
-    def _do_detect_check(self):
-        img, offset = capture_active_window()
-        threading.Thread(
-            target=self._detect_worker, args=(img, offset), daemon=True
-        ).start()
-
-    def _detect_worker(self, img, offset):
-        """Off-thread: ask the model where Check is, map it to screen coords."""
-        result = None  # (screen_x, screen_y)
-        try:
-            pos = locate_check_button(self.api_key, img, self.model)
-            record_use()
-            if pos is None:
-                status = "No Check button found — use Set Check ✓"
-            else:
-                w, h = img.size
-                sx = offset[0] + int(round(pos[0] / 100.0 * w))
-                sy = offset[1] + int(round(pos[1] / 100.0 * h))
-                result = (sx, sy)
-                status = f"Check set ({sx},{sy})"
-        except requests.exceptions.HTTPError as e:
-            status = f"API error {e.response.status_code}"
-        except requests.exceptions.ConnectionError:
-            status = "Connection error — check your internet"
-        except requests.exceptions.Timeout:
-            status = "Request timed out. Try again."
-        except Exception as e:
-            status = f"Detect error: {e}"
-        self.root.after(0, lambda: self._finish_detect(result, status))
-
-    def _finish_detect(self, result, status):
-        if result is not None:
-            set_config_value("check_button", [int(result[0]), int(result[1])])
-            self._update_calib_labels()
-            # Park the cursor on the detected spot so the position can be verified.
-            if HAS_AUTOFILL:
-                try:
-                    pyautogui.moveTo(result[0], result[1])
-                    status += " — cursor moved there to verify"
-                except Exception:
-                    pass
-        self.status.set(status)
-        self._update_usage()
-        self.scan_btn.config(state=tk.NORMAL)
-        self._scanning = False
-
-    def _autofill(self, img, offset, parsed):
+    def _autofill(self, img, offset, parsed, check_pos=None):
         """Fill each detected box with its answer, then click Check once.
 
         ``parsed`` is the list of ``(value, pos)`` from ``parse_answers``. With N
         boxes and N answers, each answer is matched to a box by its position hint
         (``assign_answers_to_boxes``); without hints it falls back to pairing in
-        reading order. Check is then clicked once to submit them all. Returns a
-        status string.
+        reading order. Check is then clicked once — at ``check_pos`` (the button
+        the model located on this scan, as ``(x%, y%)``), or a hand-calibrated
+        fallback, or Enter — to submit them all. Returns a status string.
         """
         if not HAS_AUTOFILL:
             return "Auto-fill needs: pip install pyautogui opencv-python"
@@ -876,7 +795,18 @@ class MathSolverApp:
         box_values = (
             [values[perm[i]] for i in range(len(boxes))] if perm else list(values)
         )
-        check = get_config_value("check_button")
+        # Where to click Check: prefer the button the model located on this scan
+        # (mapped from %-of-window to screen via the capture offset); fall back to
+        # a hand-calibrated position, then to pressing Enter.
+        check = None
+        if check_pos is not None:
+            w, h = img.size
+            check = (
+                offset[0] + int(round(check_pos[0] / 100.0 * w)),
+                offset[1] + int(round(check_pos[1] / 100.0 * h)),
+            )
+        if check is None:
+            check = get_config_value("check_button")
         sqrt_button = get_config_value("sqrt_button")
         needs_sqrt = any(
             k == "button" and v == "sqrt"
@@ -937,11 +867,13 @@ class MathSolverApp:
 
     def _call_api(self, img, offset):
         parsed = []
+        check_pos = None
         try:
             raw = solve_math(self.api_key, img, self.model)
             record_use()
             print(raw)  # full reply (incl. working) for the console; GUI shows answers only
             parsed = parse_answers(raw)
+            check_pos = parse_check_pos(raw)  # Check-button location for auto-fill
             display = answers_display(parsed, raw)
         except requests.exceptions.HTTPError as e:
             display = f"API error {e.response.status_code}: {e.response.text[:200]}"
@@ -952,14 +884,14 @@ class MathSolverApp:
         except Exception as e:
             display = f"Error: {e}"
         print(display)
-        self.root.after(0, lambda: self._finish(display, img, offset, parsed))
+        self.root.after(0, lambda: self._finish(display, img, offset, parsed, check_pos))
 
-    def _finish(self, display, img, offset, parsed):
+    def _finish(self, display, img, offset, parsed, check_pos=None):
         self._set_result(display)
         self._update_usage()
         status = "Ready"
         if parsed and self.auto_fill_var.get():
-            status = self._autofill(img, offset, parsed)
+            status = self._autofill(img, offset, parsed, check_pos)
         self.status.set(status)
         self.scan_btn.config(state=tk.NORMAL)
         self._scanning = False

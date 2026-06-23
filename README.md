@@ -38,22 +38,19 @@ limit (resets at midnight US Pacific).
 ## Auto-fill (optional)
 
 For self-study/practice, Sprinter can type the answer into the on-screen answer
-box and click **Check** for you. The answer box is **found automatically** by
-its color (a fixed pure blue), even though it moves between problems — no
-calibration needed for it. The Check button is a fixed position you set once.
+box and click **Check** for you. Both the answer box and the **Check** button are
+**found automatically** — the answer box by its color (a fixed pure blue), and
+the Check/Recheck button by the vision model, which reports its location in the
+same scan that solves the problem. So in the normal case **no calibration is
+needed** for either, even as they move between problems.
 
-**One-time calibration** (buttons in the window):
+**Optional calibration** (buttons in the window):
 
-1. **Check button** — two ways to set it:
-   - **Detect Check button (auto)** *(easiest)* — click it, switch to your math
-     window so the **Check**/**Recheck** button is visible before the countdown
-     ends, and Sprinter uses the vision model to find it and save its position
-     (one request, counts toward your daily usage). It then parks your cursor on
-     the spot so you can confirm it landed on the right button. Re-run it if the
-     layout is unusual.
-   - **Set Check ✓** *(manual)* — click it, then hover your cursor over the
-     **Check** button before the countdown ends. Use this to override auto-detect
-     if it picks the wrong control.
+1. **Set Check ✓** *(fallback)* — auto-location handles Check on every scan, so
+   you usually don't need this. Use it only if the model ever misses the button
+   (or grabs the wrong control): click it, then hover your cursor over the
+   **Check** button before the countdown ends. A position set here is used as a
+   fallback when the scan doesn't return one.
 2. **Set √** *(optional)* — only needed if your answers include square roots.
    Square roots can't be typed on platforms like DeltaMath; they're inserted by
    clicking a palette button. Click **Set √**, then hover over that button.
