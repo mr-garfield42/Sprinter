@@ -1,6 +1,7 @@
 import argparse
 import base64
 import io
+import itertools
 import json
 import os
 import re
@@ -62,7 +63,7 @@ BOX_MAX_ASPECT = 6.0
 
 # The model is told to reason first (greatly improves accuracy on anything that
 # needs calculation), then emit each final answer on its own ``ANSWER:`` line.
-# extract_answers() pulls those lines out for display/auto-fill, discarding the
+# parse_answers() pulls those lines out for display/auto-fill, discarding the
 # working. ANSWER_RE must stay in sync with the format requested here.
 PROMPT = (
     "Look at this screenshot and find every math problem, equation, or word "
@@ -80,8 +81,19 @@ PROMPT = (
     "logarithms, and decimals.\n\n"
     "Then, at the very END of your reply, write the final answers: one line per "
     "answer blank, each line starting with 'ANSWER:' followed by just the answer. "
-    "List them in the order the blanks appear on screen: top to bottom, then left "
-    "to right. If a problem says to round, round exactly as instructed. Give only "
+    "List them in the order the blanks appear on screen: strictly top to bottom, "
+    "going left to right only between blanks at the same height. A blank that sits "
+    "higher is listed first even when it is farther right — e.g. in a 'quotient + "
+    "remainder/divisor' answer the remainder (the fraction's numerator, sitting "
+    "higher) comes BEFORE the quotient on the main line. "
+    "On each line, also report where that blank is on screen so it can be matched "
+    "to the correct box: write the line as 'ANSWER (x%,y%): value', where x is the "
+    "horizontal position (0 = far left, 100 = far right) and y is the vertical "
+    "position (0 = top, 100 = bottom) of the CENTER of that blank in the "
+    "screenshot. For example, a remainder numerator box on the upper right might "
+    "be 'ANSWER (75%,30%): -2x^2-4' and the quotient box on the main line "
+    "'ANSWER (25%,45%): 9x-9'. "
+    "If a problem says to round, round exactly as instructed. Give only "
     "the value — no units, labels, or variable names like 'x =' .\n\n"
     "Write each answer in plain linear/calculator notation that can be typed on a "
     "keyboard: use ^ for exponents (e.g. x^2), / for fractions (e.g. 3/4), * for "
@@ -89,9 +101,18 @@ PROMPT = (
     "with the radicand ALWAYS in parentheses, e.g. sqrt(2), sqrt(x+1), 2*sqrt(3). "
     "Do NOT use Unicode superscripts/symbols, LaTeX, or \\frac."
 )
-# Matches a final-answer line like "ANSWER: 15" (case-insensitive, tolerant of an
-# index and ** markdown bold), capturing everything after the colon.
-ANSWER_RE = re.compile(r"(?i)^answer\s*\d*\s*:\s*(.+)$")
+# Matches a final-answer line like "ANSWER: 15" or, with a position hint,
+# "ANSWER (75%,30%): 15" (case-insensitive, tolerant of an index and ** markdown
+# bold). Groups: (1) x%, (2) y% — both optional — and (3) the answer text after
+# the colon. The (x, y) hint locates the blank's center as a percent of the
+# screenshot, letting auto-fill match answers to boxes by position (see
+# assign_answers_to_boxes) — robust even when blanks are laid out 2-D, e.g. an
+# inline quotient next to a higher remainder numerator.
+ANSWER_RE = re.compile(
+    r"(?i)^answer\s*\d*\s*"
+    r"(?:[\(\[]\s*(\d{1,3})\s*%?\s*,\s*(\d{1,3})\s*%?\s*[\)\]]\s*)?"
+    r":\s*(.+)$"
+)
 
 
 def load_config():
@@ -227,6 +248,41 @@ def find_answer_boxes(img, box_hsv):
     return _reading_order(candidates)
 
 
+def assign_answers_to_boxes(boxes, positions, size):
+    """Match detected boxes to answers by their on-screen position.
+
+    ``boxes`` are box centers ``[(cx, cy), ...]`` in image pixels (reading
+    order); ``positions`` are the matching per-answer hints
+    ``[(x%, y%) | None, ...]`` parsed from the reply; ``size`` is the image
+    ``(width, height)``. Returns ``perm`` where box ``i`` should be filled with
+    answer ``perm[i]`` — the assignment minimizing total box-to-hint distance.
+    Returns ``None`` (caller falls back to plain reading-order pairing) when any
+    hint is missing, the counts differ, or there are more boxes than is cheap to
+    match.
+
+    Matching on position — not a 1-D sorted order — is what makes a 2-D layout
+    reliable: an inline quotient box and a higher remainder-numerator box differ
+    clearly in x even when their y nearly coincides, so each answer still lands in
+    the right box however close the two blanks are vertically.
+    """
+    n = len(boxes)
+    if n == 0 or n != len(positions) or any(p is None for p in positions):
+        return None
+    if n > 6:  # brute-force over n! permutations; real problems have 1-3 blanks
+        return None
+    w, h = size
+    pred = [(x / 100.0 * w, y / 100.0 * h) for (x, y) in positions]
+    best, best_cost = None, None
+    for perm in itertools.permutations(range(n)):
+        cost = sum(
+            (bx - pred[perm[i]][0]) ** 2 + (by - pred[perm[i]][1]) ** 2
+            for i, (bx, by) in enumerate(boxes)
+        )
+        if best_cost is None or cost < best_cost:
+            best, best_cost = perm, cost
+    return best
+
+
 def diagnose_boxes(img, box_hsv):
     """Explain what box detection sees on ``img``, for debugging "Box not found".
 
@@ -266,14 +322,22 @@ def diagnose_boxes(img, box_hsv):
 def _reading_order(boxes):
     """Sort ``(cx, cy, h)`` boxes top-to-bottom then left-to-right.
 
-    Boxes whose vertical centers fall within roughly half a box height are
-    treated as the same row and ordered left-to-right; rows themselves go top to
-    bottom. Returns a list of ``(cx, cy)`` with the height dropped.
+    Two boxes share a row only when their vertical centers nearly coincide
+    (within ~a quarter of the median box height); within a row they go
+    left-to-right, and rows go top to bottom. A blank that sits clearly higher
+    than its neighbour — most often a fraction's *numerator*, like the remainder
+    box in a "quotient + remainder/divisor" answer — is therefore ordered before
+    a blank on the main line, not merged into its row and sorted left-to-right.
+    Half the box height (the old tolerance) merged those two and reversed them,
+    so they stopped lining up with the model's top-to-bottom answer order and the
+    answers swapped boxes. Returns ``(cx, cy)`` with the height dropped. (This is
+    only the fallback ordering; auto-fill prefers position matching — see
+    assign_answers_to_boxes.)
     """
     if not boxes:
         return []
     heights = sorted(b[2] for b in boxes)
-    row_tol = max(heights[len(heights) // 2] // 2, 10)  # half the median height
+    row_tol = max(heights[len(heights) // 2] // 4, 6)  # ~a quarter of the median height
     rows = []
     for b in sorted(boxes, key=lambda b: b[1]):  # top to bottom
         for row in rows:
@@ -387,24 +451,38 @@ def type_math(expr, sqrt_button=None, interval=0.03):
             time.sleep(0.12)
 
 
-def extract_answers(raw):
-    """Pull the final answers out of the model's reply.
+def parse_answers(raw):
+    """Pull the final answers — and any position hints — out of the model's reply.
 
     The model reasons first, then lists each final answer on its own line
-    prefixed with ``ANSWER:`` (see ``PROMPT``). Returns just those answers, one
-    per line, prefix and surrounding ``**`` bold stripped. If no such lines are
-    present (an off-format reply), falls back to the whole reply trimmed so the
-    user still sees something.
+    prefixed with ``ANSWER:`` (see ``PROMPT``), optionally carrying the blank's
+    on-screen location as ``ANSWER (x%,y%): value``. Returns a list of
+    ``(value, pos)`` in the order listed — ``pos`` is ``(x, y)`` in percent of
+    the screenshot, or ``None`` when the model gave no hint — with the prefix and
+    any surrounding ``**`` bold stripped. Returns ``[]`` for an off-format reply
+    with no ANSWER lines.
     """
-    answers = []
+    out = []
     for line in raw.splitlines():
         s = line.strip().strip("*").strip()  # drop **bold** wrapping the line
         m = ANSWER_RE.match(s)
-        if m:
-            ans = m.group(1).strip().strip("*").strip()
-            if ans:
-                answers.append(ans)
-    return "\n".join(answers) if answers else raw.strip()
+        if not m:
+            continue
+        val = m.group(3).strip().strip("*").strip()
+        if not val:
+            continue
+        pos = None
+        if m.group(1) is not None and m.group(2) is not None:
+            pos = (int(m.group(1)), int(m.group(2)))
+        out.append((val, pos))
+    return out
+
+
+def answers_display(parsed, raw):
+    """Text for the Answer box: one value per line, or the whole reply trimmed
+    when the model didn't use the ``ANSWER:`` format (so the user still sees
+    something)."""
+    return "\n".join(val for val, _ in parsed) if parsed else raw.strip()
 
 
 def image_to_base64(img):
@@ -662,35 +740,44 @@ class MathSolverApp:
         self._update_calib_labels()
         self.status.set(f"√ button set ({int(x)},{int(y)})")
 
-    def _autofill(self, img, offset, answer):
+    def _autofill(self, img, offset, parsed):
         """Fill each detected box with its answer, then click Check once.
 
-        Handles one or more boxes: with N boxes and N answer lines, the i-th
-        answer (in screen reading order) goes into the i-th box, then Check is
-        clicked a single time to submit them all. Returns a status string.
+        ``parsed`` is the list of ``(value, pos)`` from ``parse_answers``. With N
+        boxes and N answers, each answer is matched to a box by its position hint
+        (``assign_answers_to_boxes``); without hints it falls back to pairing in
+        reading order. Check is then clicked once to submit them all. Returns a
+        status string.
         """
         if not HAS_AUTOFILL:
             return "Auto-fill needs: pip install pyautogui opencv-python"
         box_hsv = get_config_value("box_color_hsv") or DEFAULT_BOX_HSV
-        lines = [ln.strip() for ln in answer.splitlines() if ln.strip()]
-        if not lines:
+        values = [v for v, _ in parsed]
+        positions = [p for _, p in parsed]
+        if not values:
             return "No answer to fill"
         boxes = find_answer_boxes(img, box_hsv)
         if not boxes:
             return "Box not found — answer shown"
-        if len(boxes) != len(lines):
-            return f"{len(lines)} answers, {len(boxes)} boxes — auto-fill skipped"
+        if len(boxes) != len(values):
+            return f"{len(values)} answers, {len(boxes)} boxes — auto-fill skipped"
+        # Match answers to boxes by position when the model gave hints; otherwise
+        # keep the reading-order pairing (i-th answer -> i-th box).
+        perm = assign_answers_to_boxes(boxes, positions, img.size)
+        box_values = (
+            [values[perm[i]] for i in range(len(boxes))] if perm else list(values)
+        )
         check = get_config_value("check_button")
         sqrt_button = get_config_value("sqrt_button")
         needs_sqrt = any(
             k == "button" and v == "sqrt"
-            for line in lines
+            for line in box_values
             for k, v in math_keyseq(line)
         )
         if needs_sqrt and not sqrt_button:
             return "√ button not set — fill skipped"
         try:
-            for (bx, by), line in zip(boxes, lines):
+            for (bx, by), line in zip(boxes, box_values):
                 pyautogui.click(offset[0] + bx, offset[1] + by)
                 time.sleep(0.15)
                 type_math(line, sqrt_button=sqrt_button)
@@ -740,13 +827,13 @@ class MathSolverApp:
         threading.Thread(target=self._call_api, args=(img, offset), daemon=True).start()
 
     def _call_api(self, img, offset):
-        answer = None
+        parsed = []
         try:
             raw = solve_math(self.api_key, img, self.model)
             record_use()
             print(raw)  # full reply (incl. working) for the console; GUI shows answers only
-            answer = extract_answers(raw)
-            display = answer
+            parsed = parse_answers(raw)
+            display = answers_display(parsed, raw)
         except requests.exceptions.HTTPError as e:
             display = f"API error {e.response.status_code}: {e.response.text[:200]}"
         except requests.exceptions.ConnectionError:
@@ -756,14 +843,14 @@ class MathSolverApp:
         except Exception as e:
             display = f"Error: {e}"
         print(display)
-        self.root.after(0, lambda: self._finish(display, img, offset, answer))
+        self.root.after(0, lambda: self._finish(display, img, offset, parsed))
 
-    def _finish(self, display, img, offset, answer):
+    def _finish(self, display, img, offset, parsed):
         self._set_result(display)
         self._update_usage()
         status = "Ready"
-        if answer and self.auto_fill_var.get():
-            status = self._autofill(img, offset, answer)
+        if parsed and self.auto_fill_var.get():
+            status = self._autofill(img, offset, parsed)
         self.status.set(status)
         self.scan_btn.config(state=tk.NORMAL)
         self._scanning = False

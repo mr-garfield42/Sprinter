@@ -59,13 +59,15 @@ set").
 After solving, Sprinter clicks the box, types the answer, and clicks Check.
 
 **Multiple boxes:** if a problem has more than one answer blank (e.g. a system of
-equations, or `x = ___` and `y = ___`), Sprinter detects all the boxes and fills
-each one. The AI lists its answers in screen reading order (top to bottom, then
-left to right) and the boxes are sorted the same way, so the first answer goes in
-the first box, and so on. It then clicks **Check** once to submit them together.
-Auto-fill only proceeds when the number of answers matches the number of boxes
-detected; otherwise it just shows the answers ("N answers, M boxes — auto-fill
-skipped").
+equations, `x = ___` and `y = ___`, or a "quotient + remainder/divisor" division
+answer), Sprinter detects all the boxes and fills each one. The AI reports where
+each blank sits on screen, and Sprinter matches every answer to the nearest box
+by position — so each value lands in the right blank even when they're laid out
+two-dimensionally (e.g. an inline quotient next to a higher remainder numerator,
+which a simple top-to-bottom ordering would swap). It then clicks **Check** once
+to submit them together. Auto-fill only proceeds when the number of answers
+matches the number of boxes detected; otherwise it just shows the answers ("N
+answers, M boxes — auto-fill skipped").
 
 **Safety / limits:**
 
