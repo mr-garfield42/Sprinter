@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import os
+import re
 import threading
 import time
 import tkinter as tk
@@ -10,7 +11,7 @@ from datetime import datetime
 from tkinter import simpledialog, ttk
 
 import requests
-from PIL import ImageGrab
+from PIL import Image, ImageGrab
 
 try:
     import pygetwindow as gw
@@ -37,8 +38,9 @@ API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completi
 MODEL = "gemini-2.5-flash-lite"  # free-tier vision model, highest free throughput; override with --model
 # Vision-capable Gemini models shown in the in-app dropdown (highest free quota first).
 MODELS = [
-    "gemini-2.5-flash-lite",  # ~1000/day, 30/min — most free throughput
+    "gemini-2.5-flash-lite",  # ~1000/day, 30/min — most free throughput, weakest
     "gemini-2.5-flash",       # stronger reasoning, lower free quota
+    "gemini-2.5-pro",         # most capable — best at reading dense notation; lowest free quota
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
 ]
@@ -53,21 +55,43 @@ DEFAULT_BOX_HSV = [120, 255, 255]
 BOX_H_TOL = 12
 BOX_S_TOL = 80
 BOX_V_TOL = 90
-BOX_MIN_AREA = 250      # bounding-box px^2 — reject specks
+BOX_MIN_AREA = 100      # bounding-box px^2 — reject specks (ALEKS empty boxes are ~220)
 BOX_MAX_AREA = 120000   # reject huge blue regions (panels, banners)
 BOX_MIN_ASPECT = 0.4    # width / height
 BOX_MAX_ASPECT = 6.0
 
+# The model is told to reason first (greatly improves accuracy on anything that
+# needs calculation), then emit each final answer on its own ``ANSWER:`` line.
+# extract_answers() pulls those lines out for display/auto-fill, discarding the
+# working. ANSWER_RE must stay in sync with the format requested here.
 PROMPT = (
-    "Look at this screenshot and find any math problem, equation, or word problem. "
-    "Respond with ONLY the final answer — no explanation, no steps, no working out. "
-    "If there are multiple problems, put each answer on its own line. "
-    "Write the answer in plain linear/calculator notation that can be typed on a "
+    "Look at this screenshot and find every math problem, equation, or word "
+    "problem that has an answer to fill in. Solve each one. "
+    "FIRST, read the expression carefully and write out exactly what each radical, "
+    "fraction bar, exponent, and parenthesis covers — for example, whether a root "
+    "sits over only the numerator or over the entire fraction, and which factors "
+    "are inside vs. outside it. Treat any small raised number as an EXPONENT on the "
+    "symbol it sits on: z^3 means z cubed (z to the third power), NOT 3 times z, and "
+    "y^7 means y to the seventh, NOT 7 times y — a raised digit is never a separate "
+    "factor or coefficient. Mis-reading this structure (radical scope, or an "
+    "exponent confused for a coefficient) is the most common mistake, so transcribe "
+    "it carefully before computing. THEN work through the calculation step by step, "
+    "carefully and accurately, especially with arithmetic, exponentials, "
+    "logarithms, and decimals.\n\n"
+    "Then, at the very END of your reply, write the final answers: one line per "
+    "answer blank, each line starting with 'ANSWER:' followed by just the answer. "
+    "List them in the order the blanks appear on screen: top to bottom, then left "
+    "to right. If a problem says to round, round exactly as instructed. Give only "
+    "the value — no units, labels, or variable names like 'x =' .\n\n"
+    "Write each answer in plain linear/calculator notation that can be typed on a "
     "keyboard: use ^ for exponents (e.g. x^2), / for fractions (e.g. 3/4), * for "
     "multiplication, and pi for the constant pi. For square roots write sqrt(...) "
     "with the radicand ALWAYS in parentheses, e.g. sqrt(2), sqrt(x+1), 2*sqrt(3). "
     "Do NOT use Unicode superscripts/symbols, LaTeX, or \\frac."
 )
+# Matches a final-answer line like "ANSWER: 15" (case-insensitive, tolerant of an
+# index and ** markdown bold), capturing everything after the colon.
+ANSWER_RE = re.compile(r"(?i)^answer\s*\d*\s*:\s*(.+)$")
 
 
 def load_config():
@@ -160,13 +184,10 @@ def capture_active_window():
     return ImageGrab.grab(), (0, 0)
 
 
-def find_answer_box(img, box_hsv):
-    """Locate the answer box by its outline color.
-
-    ``box_hsv`` is the calibrated outline color ``[h, s, v]`` (OpenCV HSV).
-    Returns the box center ``(cx, cy)`` in image pixels, or ``None`` unless
-    exactly one plausible box is found (0 or >1 candidates -> skip auto-fill).
-    """
+def _box_mask(img, box_hsv):
+    """Binary mask of pixels matching the box outline color, or ``None`` when
+    detection is unavailable / no color is set. Small gaps in the outline are
+    closed so each box forms one connected contour."""
     if not HAS_AUTOFILL or not box_hsv:
         return None
     rgb = np.array(img.convert("RGB"))
@@ -175,9 +196,23 @@ def find_answer_box(img, box_hsv):
     lower = np.array([max(h - BOX_H_TOL, 0), max(s - BOX_S_TOL, 0), max(v - BOX_V_TOL, 0)])
     upper = np.array([min(h + BOX_H_TOL, 179), min(s + BOX_S_TOL, 255), min(v + BOX_V_TOL, 255)])
     mask = cv2.inRange(hsv, lower, upper)
-    # Close small gaps so the outline forms one connected contour
     kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+
+def find_answer_boxes(img, box_hsv):
+    """Locate every answer box by its outline color, in reading order.
+
+    ``box_hsv`` is the calibrated outline color ``[h, s, v]`` (OpenCV HSV).
+    Returns a list of box centers ``[(cx, cy), ...]`` in image pixels, sorted
+    top-to-bottom then left-to-right. That ordering lines the boxes up with the
+    AI's answers, which are listed in the same reading order, so the first answer
+    fills the first box and so on. Returns ``[]`` if detection is unavailable or
+    no plausible box is found.
+    """
+    mask = _box_mask(img, box_hsv)
+    if mask is None:
+        return []
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates = []
     for c in contours:
@@ -188,10 +223,69 @@ def find_answer_box(img, box_hsv):
         aspect = w / ht if ht else 0
         if aspect < BOX_MIN_ASPECT or aspect > BOX_MAX_ASPECT:
             continue
-        candidates.append((x + w // 2, y + ht // 2))
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
+        candidates.append((x + w // 2, y + ht // 2, ht))
+    return _reading_order(candidates)
+
+
+def diagnose_boxes(img, box_hsv):
+    """Explain what box detection sees on ``img``, for debugging "Box not found".
+
+    Returns ``(report, mask)`` where ``report`` is a human-readable string listing
+    every colored region found and whether it passed the area/aspect filters (and
+    if not, why), and ``mask`` is the binary color mask (or ``None``). The summary
+    line comes first so it's readable even in a small text box.
+    """
+    mask = _box_mask(img, box_hsv)
+    if mask is None:
+        return ("No detection: opencv/numpy missing, or no box color set.", None)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    details, passed = [], 0
+    for c in sorted(contours, key=lambda c: cv2.boundingRect(c)[1]):  # top to bottom
+        x, y, w, ht = cv2.boundingRect(c)
+        area = w * ht
+        aspect = w / ht if ht else 0
+        why = []
+        if area < BOX_MIN_AREA:
+            why.append("too small")
+        if area > BOX_MAX_AREA:
+            why.append("too big")
+        if aspect < BOX_MIN_ASPECT:
+            why.append("too tall")
+        if aspect > BOX_MAX_ASPECT:
+            why.append("too wide")
+        passed += not why
+        tag = "OK" if not why else "drop: " + ", ".join(why)
+        details.append(f"  {w}x{ht}px area={area} aspect={aspect:.1f}  [{tag}]")
+    summary = (
+        f"Box color HSV {list(box_hsv)}\n"
+        f"{len(contours)} blue region(s) found, {passed} usable as box(es)."
+    )
+    return ("\n".join([summary, *details]), mask)
+
+
+def _reading_order(boxes):
+    """Sort ``(cx, cy, h)`` boxes top-to-bottom then left-to-right.
+
+    Boxes whose vertical centers fall within roughly half a box height are
+    treated as the same row and ordered left-to-right; rows themselves go top to
+    bottom. Returns a list of ``(cx, cy)`` with the height dropped.
+    """
+    if not boxes:
+        return []
+    heights = sorted(b[2] for b in boxes)
+    row_tol = max(heights[len(heights) // 2] // 2, 10)  # half the median height
+    rows = []
+    for b in sorted(boxes, key=lambda b: b[1]):  # top to bottom
+        for row in rows:
+            if abs(b[1] - row[0][1]) <= row_tol:
+                row.append(b)
+                break
+        else:
+            rows.append([b])
+    ordered = []
+    for row in rows:
+        ordered.extend(sorted(row, key=lambda b: b[0]))  # left to right within a row
+    return [(b[0], b[1]) for b in ordered]
 
 
 def _read_paren(expr, i):
@@ -293,6 +387,26 @@ def type_math(expr, sqrt_button=None, interval=0.03):
             time.sleep(0.12)
 
 
+def extract_answers(raw):
+    """Pull the final answers out of the model's reply.
+
+    The model reasons first, then lists each final answer on its own line
+    prefixed with ``ANSWER:`` (see ``PROMPT``). Returns just those answers, one
+    per line, prefix and surrounding ``**`` bold stripped. If no such lines are
+    present (an off-format reply), falls back to the whole reply trimmed so the
+    user still sees something.
+    """
+    answers = []
+    for line in raw.splitlines():
+        s = line.strip().strip("*").strip()  # drop **bold** wrapping the line
+        m = ANSWER_RE.match(s)
+        if m:
+            ans = m.group(1).strip().strip("*").strip()
+            if ans:
+                answers.append(ans)
+    return "\n".join(answers) if answers else raw.strip()
+
+
 def image_to_base64(img):
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -371,6 +485,18 @@ class MathSolverApp:
             pady=6,
             command=self.change_key,
         ).pack(side=tk.LEFT, padx=4)
+
+        # Debug: report what box detection sees (diagnoses "Box not found").
+        self.debug_btn = tk.Button(
+            btn_frame,
+            text="Debug",
+            font=("Segoe UI", 9),
+            relief="flat",
+            padx=6,
+            pady=6,
+            command=self.debug_detect,
+        )
+        self.debug_btn.pack(side=tk.LEFT, padx=4)
 
         # Model picker — switch AI models on the fly; the choice persists in config.
         model_frame = tk.Frame(root)
@@ -537,32 +663,45 @@ class MathSolverApp:
         self.status.set(f"√ button set ({int(x)},{int(y)})")
 
     def _autofill(self, img, offset, answer):
-        """Click the box, type the answer, click Check. Returns a status string."""
+        """Fill each detected box with its answer, then click Check once.
+
+        Handles one or more boxes: with N boxes and N answer lines, the i-th
+        answer (in screen reading order) goes into the i-th box, then Check is
+        clicked a single time to submit them all. Returns a status string.
+        """
         if not HAS_AUTOFILL:
             return "Auto-fill needs: pip install pyautogui opencv-python"
         box_hsv = get_config_value("box_color_hsv") or DEFAULT_BOX_HSV
         lines = [ln.strip() for ln in answer.splitlines() if ln.strip()]
-        if len(lines) != 1:
-            return f"{len(lines)} answers — auto-fill skipped"
-        box = find_answer_box(img, box_hsv)
-        if box is None:
+        if not lines:
+            return "No answer to fill"
+        boxes = find_answer_boxes(img, box_hsv)
+        if not boxes:
             return "Box not found — answer shown"
-        sx, sy = offset[0] + box[0], offset[1] + box[1]
+        if len(boxes) != len(lines):
+            return f"{len(lines)} answers, {len(boxes)} boxes — auto-fill skipped"
         check = get_config_value("check_button")
         sqrt_button = get_config_value("sqrt_button")
-        needs_sqrt = any(k == "button" and v == "sqrt" for k, v in math_keyseq(lines[0]))
+        needs_sqrt = any(
+            k == "button" and v == "sqrt"
+            for line in lines
+            for k, v in math_keyseq(line)
+        )
         if needs_sqrt and not sqrt_button:
             return "√ button not set — fill skipped"
         try:
-            pyautogui.click(sx, sy)
-            time.sleep(0.15)
-            type_math(lines[0], sqrt_button=sqrt_button)
-            time.sleep(0.15)
+            for (bx, by), line in zip(boxes, lines):
+                pyautogui.click(offset[0] + bx, offset[1] + by)
+                time.sleep(0.15)
+                type_math(line, sqrt_button=sqrt_button)
+                time.sleep(0.15)
+            n = len(boxes)
+            suffix = f" ({n} boxes)" if n > 1 else ""
             if check:
                 pyautogui.click(check[0], check[1])
-                return "Filled & submitted"
+                return f"Filled & submitted{suffix}"
             pyautogui.press("enter")
-            return "Filled & submitted (Enter)"
+            return f"Filled & submitted (Enter){suffix}"
         except pyautogui.FailSafeException:
             return "Aborted (failsafe)"
         except Exception as e:
@@ -605,8 +744,9 @@ class MathSolverApp:
         try:
             raw = solve_math(self.api_key, img, self.model)
             record_use()
-            display = raw.strip()
-            answer = display
+            print(raw)  # full reply (incl. working) for the console; GUI shows answers only
+            answer = extract_answers(raw)
+            display = answer
         except requests.exceptions.HTTPError as e:
             display = f"API error {e.response.status_code}: {e.response.text[:200]}"
         except requests.exceptions.ConnectionError:
@@ -625,6 +765,43 @@ class MathSolverApp:
         if answer and self.auto_fill_var.get():
             status = self._autofill(img, offset, answer)
         self.status.set(status)
+        self.scan_btn.config(state=tk.NORMAL)
+        self._scanning = False
+
+    # --- Debug: diagnose box detection (no API call) ---
+
+    def debug_detect(self):
+        """Capture the active window and report what box detection sees."""
+        if self._scanning:
+            return
+        self._scanning = True
+        self.scan_btn.config(state=tk.DISABLED)
+        self._debug_countdown(COUNTDOWN_SECONDS)
+
+    def _debug_countdown(self, remaining):
+        if remaining > 0:
+            self.status.set(f"Switch to your window... {remaining}")
+            self.root.after(1000, self._debug_countdown, remaining - 1)
+        else:
+            self.status.set("Capturing for debug...")
+            self.root.after(50, self._do_debug)
+
+    def _do_debug(self):
+        img, _ = capture_active_window()
+        box_hsv = get_config_value("box_color_hsv") or DEFAULT_BOX_HSV
+        report, mask = diagnose_boxes(img, box_hsv)
+        # Save only the mask — it's just the matched outlines (black/white), so it
+        # contains no readable screen content. The full screenshot is never written.
+        try:
+            if mask is not None:
+                here = os.path.dirname(os.path.abspath(__file__))
+                Image.fromarray(mask).save(os.path.join(here, "debug_mask.png"))
+                report += "\nSaved debug_mask.png (matched outlines only — no screen content)."
+        except Exception as e:
+            report += f"\n(could not save debug mask: {e})"
+        print(report)
+        self._set_result(report)
+        self.status.set("Debug done — see Answer box")
         self.scan_btn.config(state=tk.NORMAL)
         self._scanning = False
 

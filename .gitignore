@@ -7,3 +7,7 @@ __pycache__/
 
 # Editor / tooling
 .claude/
+
+# Debug artifacts from the Debug button (may reflect screen contents)
+debug_capture.png
+debug_mask.png

@@ -58,13 +58,22 @@ set").
 **Use it:** tick **Auto-fill answer & submit**, then **Scan & Solve** as usual.
 After solving, Sprinter clicks the box, types the answer, and clicks Check.
 
+**Multiple boxes:** if a problem has more than one answer blank (e.g. a system of
+equations, or `x = ___` and `y = ___`), Sprinter detects all the boxes and fills
+each one. The AI lists its answers in screen reading order (top to bottom, then
+left to right) and the boxes are sorted the same way, so the first answer goes in
+the first box, and so on. It then clicks **Check** once to submit them together.
+Auto-fill only proceeds when the number of answers matches the number of boxes
+detected; otherwise it just shows the answers ("N answers, M boxes — auto-fill
+skipped").
+
 **Safety / limits:**
 
 - **Abort any time** by slamming the mouse cursor into a screen corner
   (PyAutoGUI failsafe).
-- Auto-fill only fires when there's **exactly one** answer and **exactly one**
-  box is detected; otherwise it just shows the answer ("Box not found" /
-  "N answers — auto-fill skipped").
+- Auto-fill only fires when the **number of answers matches the number of boxes**
+  detected (one box, or several); otherwise it just shows the answer ("Box not
+  found" / "N answers, M boxes — auto-fill skipped").
 - Sprinter types answers in linear notation (`^` for exponents, `/` for
   fractions) and presses the Right arrow to exit each exponent/fraction block,
   so **MathQuill-style fields** (e.g. DeltaMath) render correctly. Square roots
@@ -76,6 +85,20 @@ After solving, Sprinter clicks the box, types the answer, and clicks Check.
 - Calibration is saved in `config.json` (`auto_fill`, `box_color_hsv`,
   `check_button`).
 
+**Troubleshooting "Box not found":**
+
+- Sprinter is a desktop app — code changes only take effect after you **fully
+  close and relaunch** it (it doesn't hot-reload).
+- Click the **Debug** button (next to *Key*), then switch to your math window
+  during the countdown. It makes **no API call** and writes a report into the
+  Answer box: how many blue regions it found and, for each, whether it's usable
+  as a box (or why it was rejected — *too small/big/tall/wide*). It also saves
+  `debug_mask.png` (just the matched outlines in black/white — no readable screen
+  content) next to the app, so you can see exactly what detection is keying on.
+- *0 blue regions* → the outline color doesn't match; re-run **Set box color**,
+  hovering precisely on a box edge. *Regions found but dropped* → the size/aspect
+  thresholds need tuning for your boxes (tell us the numbers from the report).
+
 ### Options
 
 ```
@@ -85,16 +108,31 @@ python math_solver.py --daily-limit 250            # adjust the usage-counter ca
 ```
 
 The default model is **gemini-2.5-flash-lite** — a free vision model with the
-highest free-tier throughput (~1,000 requests/day, 30/min). If you find answers
-less accurate on harder problems, switch to `gemini-2.5-flash` for stronger
-reasoning at a lower free quota.
+highest free-tier throughput (~1,000 requests/day, 30/min), but it's also the
+**weakest at reading dense math notation** (superscripts, radicals, fractions).
+For problems with exponents/roots/fractions, switch to a stronger model:
+
+- `gemini-2.5-flash` — much better at parsing notation, still a decent free quota.
+- `gemini-2.5-pro` — the most capable (best at reading compact notation
+  correctly), but the **lowest** free quota — best saved for the tricky ones.
 
 You don't need the flag for this: the window has a **Model** dropdown to switch
 between models on the fly. Your choice is saved, so when one model's daily quota
 runs out you can flip to another and back again later when it resets.
 
+**Tip:** most wrong answers on expand/simplify problems come from the model
+*mis-reading* a tiny superscript or radical, not from bad algebra. **Zoom in your
+browser (Ctrl + +) so the expression is large** before scanning — bigger, clearer
+notation is read far more reliably.
+
 ## Notes
 
+- The model is asked to **show its working first, then list each final answer**;
+  Sprinter extracts just the answers to display/type. Letting it reason makes a
+  big difference on problems that need calculation (exponentials, logs, multi-step
+  arithmetic) — but it's still an AI and **can be wrong**, so check answers on
+  anything that matters. For harder problems, switch to `gemini-2.5-flash` (the
+  **Model** dropdown) for stronger reasoning.
 - `config.json` holds your API key and usage counter and is **gitignored** —
   never commit it.
 - The usage counter is tracked locally; Google does not expose a live
